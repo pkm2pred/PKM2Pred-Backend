@@ -1,8 +1,1 @@
-flask==3.0.3
-flask-cors==4.0.0
-padelpy==0.1.14
-pandas==2.2.2
-joblib==1.4.2
-gunicorn==21.2.0 
-scikit-learn==1.5.0
-numpy==1.26.4
+
