@@ -6,11 +6,84 @@ import os
 import numpy as np # Added for regression
 import sklearn # Referenced by joblib, good to have explicit import if version matters
 from flask_cors import CORS
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+import io
+import threading
+import psycopg2
+from psycopg2 import pool
 
 app = Flask(__name__)
 
 # CORS Configuration (user's original)
 CORS(app)
+
+# Email Configuration for Gmail SMTP
+SMTP_SERVER = 'smtp.gmail.com'
+SMTP_PORT = 587
+SENDER_EMAIL = os.environ.get('SENDER_EMAIL', 'pkm2pred@gmail.com')  # Set this in environment
+SENDER_PASSWORD = os.environ.get('SENDER_PASSWORD', 'lgispsgejlwbwsjq')  # Use App Password for Gmail
+
+# Database Configuration for NeonDB
+DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://neondb_owner:npg_BYMn6zGstrP0@ep-morning-lab-a4btclz8-pooler.us-east-1.aws.neon.tech/neondb')
+
+# Initialize database connection pool
+try:
+    db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, DATABASE_URL)
+    print("Database connection pool created successfully.")
+except Exception as e:
+    print(f"Error creating database connection pool: {str(e)}")
+    db_pool = None
+
+# Database helper functions
+def check_user_exists(email):
+    """Check if a user exists in the database by email"""
+    if not db_pool:
+        return False
+    
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT email FROM users WHERE email = %s", (email,))
+        result = cursor.fetchone()
+        cursor.close()
+        return result is not None
+    except Exception as e:
+        print(f"Error checking user existence: {str(e)}")
+        return False
+    finally:
+        if conn:
+            db_pool.putconn(conn)
+
+def add_user(email, name, affiliation):
+    """Add a new user to the database"""
+    if not db_pool:
+        return False
+    
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO users (email, name, affiliation) VALUES (%s, %s, %s)",
+            (email, name, affiliation)
+        )
+        conn.commit()
+        cursor.close()
+        print(f"User added successfully: {email}")
+        return True
+    except Exception as e:
+        print(f"Error adding user: {str(e)}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            db_pool.putconn(conn)
 
 # --- Determine Base Directory ---
 base_dir = os.path.dirname(__file__)
@@ -87,6 +160,210 @@ print(f"Classification model will use {len(classification_required_descriptors)}
 print(f"Regression models will use {len(regression_required_descriptors)} descriptors (verified order).")
 
 
+def send_email_with_results(recipient_email, compound_count, csv_content):
+    """Send email with CSV results attachment in a separate thread"""
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = recipient_email
+        msg['Subject'] = f'PKM2Pred Results - {compound_count} Compounds Processed'
+        
+        # Email body
+        body = f"""
+        Dear User,
+
+        Thank you for using PKM2Pred!
+
+        We have successfully processed {compound_count} compounds. 
+        The results are attached as a CSV file.
+
+        Best regards,
+        PKM2Pred Team
+        """
+        
+        msg.attach(MIMEText(body, 'plain'))
+        
+        # Attach CSV file
+        csv_attachment = MIMEBase('application', 'octet-stream')
+        csv_attachment.set_payload(csv_content.encode('utf-8'))
+        encoders.encode_base64(csv_attachment)
+        csv_attachment.add_header('Content-Disposition', 'attachment', filename='pkm2pred_results.csv')
+        msg.attach(csv_attachment)
+        
+        # Send email
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        text = msg.as_string()
+        server.sendmail(SENDER_EMAIL, recipient_email, text)
+        server.quit()
+        
+        print(f"Email sent successfully to {recipient_email}")
+        return True
+    except Exception as e:
+        print(f"Error sending email: {str(e)}")
+        return False
+
+
+def process_and_email_results(compounds_input, percentage, recipient_email):
+    """Process compounds and send results via email - runs in background thread"""
+    try:
+        all_classification_results = {}
+        all_regression_results = {}
+        all_descriptors_results = {}
+        
+        for smiles_string in compounds_input:
+            if not smiles_string:
+                continue
+                
+            try:
+                descriptor_dict = from_smiles(smiles_string, timeout=60)
+                
+                # Extract descriptor values
+                descriptors_for_display = {}
+                for key in classification_required_descriptors:
+                    value = descriptor_dict.get(key)
+                    if value is None or value == '':
+                        descriptors_for_display[key] = 0.0
+                    else:
+                        try:
+                            descriptors_for_display[key] = float(value)
+                        except ValueError:
+                            descriptors_for_display[key] = 0.0
+                all_descriptors_results[smiles_string] = descriptors_for_display
+                
+                # Classification
+                clf_filtered_values = []
+                for key in classification_required_descriptors:
+                    value = descriptor_dict.get(key)
+                    val_to_append = 0.0
+                    if value is None:
+                        pass
+                    else:
+                        try:
+                            val_to_append = float(value)
+                        except ValueError:
+                            pass
+                    clf_filtered_values.append(val_to_append)
+                df_classification = pd.DataFrame([clf_filtered_values], columns=classification_required_descriptors)
+                
+                classification_prediction_array = clf_model.predict(df_classification)
+                classification_result = str(classification_prediction_array[0])
+                all_classification_results[smiles_string] = classification_result
+                
+                # Regression for activators
+                if classification_result == "Activator" and saved_regression_trees:
+                    reg_filtered_values = []
+                    for key in regression_required_descriptors:
+                        value = descriptor_dict.get(key)
+                        val_to_append = 0.0
+                        if value is not None:
+                            try:
+                                val_to_append = float(value)
+                            except ValueError:
+                                pass
+                        reg_filtered_values.append(val_to_append)
+                    df_regression = pd.DataFrame([reg_filtered_values], columns=regression_required_descriptors)
+                    
+                    individual_reg_predictions = []
+                    for tree_model in saved_regression_trees:
+                        try:
+                            pred = tree_model.predict(df_regression)
+                            individual_reg_predictions.append(pred[0])
+                        except Exception:
+                            pass
+                    
+                    if individual_reg_predictions:
+                        all_reg_predictions_np = np.array(individual_reg_predictions)
+                        alpha = (100.0 - percentage) / 2.0
+                        lower_bound = float(np.percentile(all_reg_predictions_np, alpha))
+                        upper_bound = float(np.percentile(all_reg_predictions_np, 100.0 - alpha))
+                        median_prediction = float(np.median(all_reg_predictions_np))
+                        
+                        all_regression_results[smiles_string] = {
+                            "regression_AC50_median": median_prediction,
+                            "regression_AC50_lower_bound": lower_bound,
+                            "regression_AC50_upper_bound": upper_bound,
+                        }
+            except Exception:
+                all_classification_results[smiles_string] = "Error"
+        
+        # Create CSV content
+        descriptor_headers = [
+            'nN', 'nX', 'AATS2i', 'nBondsD', 'nBondsD2', 'C1SP2', 'C3SP2', 'SCH-5',
+            'nHssNH', 'ndssC', 'nssNH', 'SdssC', 'SdS', 'mindO', 'mindS', 'minssS',
+            'maxdssC', 'ETA_dAlpha_B', 'MDEN-23', 'n5Ring', 'nT5Ring', 'nHeteroRing',
+            'n5HeteroRing', 'nT5HeteroRing', 'SRW5', 'SRW7', 'SRW9', 'WTPT-5'
+        ]
+        
+        csv_lines = []
+        headers = ['Compound (SMILES)', 'Modulator Type', 'AC50 Range'] + descriptor_headers
+        csv_lines.append(','.join(headers))
+        
+        for smiles, classification in all_classification_results.items():
+            ac50_display = 'N/A'
+            if classification == 'Activator' and smiles in all_regression_results:
+                reg_data = all_regression_results[smiles]
+                ac50_display = f"Median: {reg_data['regression_AC50_median']:.2f}; Range: [{reg_data['regression_AC50_lower_bound']:.2f} - {reg_data['regression_AC50_upper_bound']:.2f}]"
+            
+            descriptor_values = []
+            for header in descriptor_headers:
+                val = all_descriptors_results.get(smiles, {}).get(header, 0.0)
+                descriptor_values.append(f"{val:.4f}")
+            
+            row = [smiles, classification, ac50_display] + descriptor_values
+            csv_lines.append(','.join([f'"{field}"' if ',' in str(field) else str(field) for field in row]))
+        
+        csv_content = '\n'.join(csv_lines)
+        
+        # Send email
+        send_email_with_results(recipient_email, len(compounds_input), csv_content)
+        
+    except Exception as e:
+        print(f"Error in background processing: {str(e)}")
+
+
+@app.route("/api/check-user", methods=["POST"])
+def check_user():
+    """Check if a user exists in the database"""
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No input data provided."}), 400
+    
+    email = data.get("email")
+    if not email:
+        return jsonify({"error": "Email is required."}), 400
+    
+    exists = check_user_exists(email)
+    return jsonify({"exists": exists, "email": email})
+
+
+@app.route("/api/register-user", methods=["POST"])
+def register_user():
+    """Register a new user in the database"""
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No input data provided."}), 400
+    
+    email = data.get("email")
+    name = data.get("name")
+    affiliation = data.get("affiliation")
+    
+    if not email or not name or not affiliation:
+        return jsonify({"error": "Email, name, and affiliation are required."}), 400
+    
+    # Check if user already exists
+    if check_user_exists(email):
+        return jsonify({"error": "User already exists.", "exists": True}), 400
+    
+    # Add user to database
+    success = add_user(email, name, affiliation)
+    if success:
+        return jsonify({"success": True, "message": "User registered successfully.", "email": email})
+    else:
+        return jsonify({"error": "Failed to register user. Please try again."}), 500
+
+
 @app.route("/api/predict", methods=["POST"])
 def predict():
     if clf_model is None:
@@ -98,6 +375,7 @@ def predict():
 
     compounds_input = data.get("compound")
     percentage_str = data.get("percentage")
+    user_email = data.get("email")
 
     if not isinstance(compounds_input, list):
         if isinstance(compounds_input, str):
@@ -241,6 +519,48 @@ def predict():
     }
     if batch_processing_errors:
         final_response["batch_processing_errors"] = batch_processing_errors
+    
+    # Add email info if provided for large batches
+    if user_email and len(compounds_input) > 20:
+        final_response["email_sent"] = True
+        final_response["recipient_email"] = user_email
+        final_response["compound_count"] = len(compounds_input)
+        
+        # Send email in background thread AFTER returning results
+        descriptor_headers = [
+            'nN', 'nX', 'AATS2i', 'nBondsD', 'nBondsD2', 'C1SP2', 'C3SP2', 'SCH-5',
+            'nHssNH', 'ndssC', 'nssNH', 'SdssC', 'SdS', 'mindO', 'mindS', 'minssS',
+            'maxdssC', 'ETA_dAlpha_B', 'MDEN-23', 'n5Ring', 'nT5Ring', 'nHeteroRing',
+            'n5HeteroRing', 'nT5HeteroRing', 'SRW5', 'SRW7', 'SRW9', 'WTPT-5'
+        ]
+        
+        csv_lines = []
+        headers = ['Compound (SMILES)', 'Modulator Type', 'AC50 Range'] + descriptor_headers
+        csv_lines.append(','.join(headers))
+        
+        for smiles, classification in all_classification_results.items():
+            ac50_display = 'N/A'
+            if classification == 'Activator' and smiles in all_regression_results:
+                reg_data = all_regression_results[smiles]
+                ac50_display = f"Median: {reg_data['regression_AC50_median']:.2f}; Range: [{reg_data['regression_AC50_lower_bound']:.2f} - {reg_data['regression_AC50_upper_bound']:.2f}]"
+            
+            descriptor_values = []
+            for header in descriptor_headers:
+                val = all_descriptors_results.get(smiles, {}).get(header, 0.0)
+                descriptor_values.append(f"{val:.4f}")
+            
+            row = [smiles, classification, ac50_display] + descriptor_values
+            csv_lines.append(','.join([f'"{field}"' if ',' in str(field) else str(field) for field in row]))
+        
+        csv_content = '\n'.join(csv_lines)
+        
+        # Send email in background
+        thread = threading.Thread(
+            target=send_email_with_results, 
+            args=(user_email, len(compounds_input), csv_content)
+        )
+        thread.daemon = True
+        thread.start()
     
     print("Batch processing complete. Returning results.")
     return jsonify(final_response)
