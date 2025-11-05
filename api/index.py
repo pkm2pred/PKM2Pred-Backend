@@ -24,11 +24,11 @@ CORS(app)
 # Email Configuration for Gmail SMTP
 SMTP_SERVER = 'smtp.gmail.com'
 SMTP_PORT = 587
-SENDER_EMAIL = os.environ.get('SENDER_EMAIL', 'pkm2pred@gmail.com')  # Set this in environment
-SENDER_PASSWORD = os.environ.get('SENDER_PASSWORD', 'lgispsgejlwbwsjq')  # Use App Password for Gmail
+SENDER_EMAIL = os.environ.get('SENDER_EMAIL')  # Set this in environment
+SENDER_PASSWORD = os.environ.get('SENDER_PASSWORD')  # Use App Password for Gmail
 
 # Database Configuration for NeonDB
-DATABASE_URL = os.environ.get('DATABASE_URL', 'postgresql://neondb_owner:npg_BYMn6zGstrP0@ep-morning-lab-a4btclz8-pooler.us-east-1.aws.neon.tech/neondb')
+DATABASE_URL = os.environ.get('DATABASE_URL')
 
 # Initialize database connection pool
 try:
