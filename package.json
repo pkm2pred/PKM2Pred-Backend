@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "concurrently \"npm run next-dev\" \"npm run flask-dev\"",
     "next-dev": "next dev",
-    "flask-dev": "python -m flask --app api/index run -p 5328",
+    "flask-dev": "python3 -m flask --app api/index run -p 5328",
     "build": "next build",
     "start": "next start",
     "start-production": "concurrently \"/app/venv/bin/python api/index.py\" \"next start\""

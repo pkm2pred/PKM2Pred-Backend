@@ -119,6 +119,7 @@ def predict():
     
     all_classification_results = {}
     all_regression_results = {}
+    all_descriptors_results = {}
     batch_processing_errors = []
 
     print(f"Starting batch processing for {len(compounds_input)} compounds.")
@@ -133,6 +134,19 @@ def predict():
         try:
             print(f"Processing SMILES: {smiles_string[:30]}...")
             descriptor_dict = from_smiles(smiles_string, timeout=60)
+            
+            # --- Extract descriptor values for display ---
+            descriptors_for_display = {}
+            for key in classification_required_descriptors:
+                value = descriptor_dict.get(key)
+                if value is None or value == '':
+                    descriptors_for_display[key] = 0.0
+                else:
+                    try:
+                        descriptors_for_display[key] = float(value)
+                    except ValueError:
+                        descriptors_for_display[key] = 0.0
+            all_descriptors_results[smiles_string] = descriptors_for_display
             
             # --- Prepare DataFrame for Classification ---
             clf_filtered_values = []
@@ -222,7 +236,8 @@ def predict():
 
     final_response = {
         "classification_results": all_classification_results,
-        "regression_results": all_regression_results
+        "regression_results": all_regression_results,
+        "descriptors_results": all_descriptors_results
     }
     if batch_processing_errors:
         final_response["batch_processing_errors"] = batch_processing_errors
