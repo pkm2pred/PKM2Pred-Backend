@@ -14,59 +14,44 @@ from email import encoders
 import io
 import threading
 import psycopg2
-from psycopg2 import pool
+from psycopg2.extras import RealDictCursor
 
 app = Flask(__name__)
 
-# CORS Configuration (user's original)
+# CORS Configuration
 CORS(app)
 
 # Email Configuration for Gmail SMTP
 SMTP_SERVER = 'smtp.gmail.com'
 SMTP_PORT = 587
-SENDER_EMAIL = os.environ.get('SENDER_EMAIL')  # Set this in environment
-SENDER_PASSWORD = os.environ.get('SENDER_PASSWORD')  # Use App Password for Gmail
+SENDER_EMAIL = os.environ.get('SENDER_EMAIL')
+SENDER_PASSWORD = os.environ.get('SENDER_PASSWORD')
 
 # Database Configuration for NeonDB
-DATABASE_URL = os.environ.get('DATABASE_URL')
+DATABASE_URL = os.environ.get('DB_URL')
 
-# Initialize database connection pool
-try:
-    db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, DATABASE_URL)
-    print("Database connection pool created successfully.")
-except Exception as e:
-    print(f"Error creating database connection pool: {str(e)}")
-    db_pool = None
+def get_db_connection():
+    """Get database connection"""
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
-# Database helper functions
 def check_user_exists(email):
-    """Check if a user exists in the database by email"""
-    if not db_pool:
-        return False
-    
-    conn = None
+    """Check if user exists in database by email"""
     try:
-        conn = db_pool.getconn()
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT email FROM users WHERE email = %s", (email,))
         result = cursor.fetchone()
         cursor.close()
+        conn.close()
         return result is not None
     except Exception as e:
-        print(f"Error checking user existence: {str(e)}")
+        print(f"Database error checking user: {e}")
         return False
-    finally:
-        if conn:
-            db_pool.putconn(conn)
 
-def add_user(email, name, affiliation):
-    """Add a new user to the database"""
-    if not db_pool:
-        return False
-    
-    conn = None
+def create_user(email, name, affiliation):
+    """Create new user in database"""
     try:
-        conn = db_pool.getconn()
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO users (email, name, affiliation) VALUES (%s, %s, %s)",
@@ -74,16 +59,11 @@ def add_user(email, name, affiliation):
         )
         conn.commit()
         cursor.close()
-        print(f"User added successfully: {email}")
+        conn.close()
         return True
     except Exception as e:
-        print(f"Error adding user: {str(e)}")
-        if conn:
-            conn.rollback()
+        print(f"Database error creating user: {e}")
         return False
-    finally:
-        if conn:
-            db_pool.putconn(conn)
 
 # --- Determine Base Directory ---
 base_dir = os.path.dirname(__file__)
@@ -324,44 +304,23 @@ def process_and_email_results(compounds_input, percentage, recipient_email):
 
 
 @app.route("/api/check-user", methods=["POST"])
-def check_user():
-    """Check if a user exists in the database"""
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "No input data provided."}), 400
+def check_user_route():
+    """Check if user exists in database by email"""
+    try:
+        data = request.get_json()
+        if not data or 'email' not in data:
+            return jsonify({'error': 'Email is required'}), 400
+        
+        email = data['email'].strip()
+        if not email:
+            return jsonify({'error': 'Email cannot be empty'}), 400
+        
+        user_exists = check_user_exists(email)
+        return jsonify({'exists': user_exists})
     
-    email = data.get("email")
-    if not email:
-        return jsonify({"error": "Email is required."}), 400
-    
-    exists = check_user_exists(email)
-    return jsonify({"exists": exists, "email": email})
-
-
-@app.route("/api/register-user", methods=["POST"])
-def register_user():
-    """Register a new user in the database"""
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "No input data provided."}), 400
-    
-    email = data.get("email")
-    name = data.get("name")
-    affiliation = data.get("affiliation")
-    
-    if not email or not name or not affiliation:
-        return jsonify({"error": "Email, name, and affiliation are required."}), 400
-    
-    # Check if user already exists
-    if check_user_exists(email):
-        return jsonify({"error": "User already exists.", "exists": True}), 400
-    
-    # Add user to database
-    success = add_user(email, name, affiliation)
-    if success:
-        return jsonify({"success": True, "message": "User registered successfully.", "email": email})
-    else:
-        return jsonify({"error": "Failed to register user. Please try again."}), 500
+    except Exception as e:
+        print(f"Error in check_user_route: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route("/api/predict", methods=["POST"])
@@ -376,6 +335,8 @@ def predict():
     compounds_input = data.get("compound")
     percentage_str = data.get("percentage")
     user_email = data.get("email")
+    user_name = data.get("name")
+    user_affiliation = data.get("affiliation")
 
     if not isinstance(compounds_input, list):
         if isinstance(compounds_input, str):
@@ -385,6 +346,25 @@ def predict():
     
     if not all(isinstance(s, str) for s in compounds_input):
         return jsonify({"error": "All items in the 'compound' list must be SMILES strings."}), 400
+    
+    # Check if this is a large batch that requires email
+    is_large_batch = len(compounds_input) > 20
+    
+    if is_large_batch and not user_email:
+        return jsonify({"error": "Email is required for batches larger than 20 compounds"}), 400
+    
+    # For large batches, handle user registration
+    if is_large_batch:
+        user_exists = check_user_exists(user_email)
+        if not user_exists:
+            # New user - name and affiliation are required
+            if not user_name or not user_affiliation:
+                return jsonify({"error": "Name and affiliation are required for new users", "user_exists": False}), 400
+            
+            # Create new user in database
+            if not create_user(user_email, user_name, user_affiliation):
+                return jsonify({"error": "Failed to register user. Please try again."}), 500
+            print(f"New user registered: {user_email}")
 
     percentage = 95.0 
     if percentage_str is not None:
